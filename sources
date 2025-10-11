@@ -1,0 +1,26 @@
+TARGETNAME=nvme2k
+TARGETPATH=obj
+TARGETTYPE=MINIPORT
+
+INCLUDES=..\..\inc;..\..\..\inc
+
+TARGETLIBS=$(DDK_LIB_PATH)\scsiport.lib
+
+!IF $(ALPHA) || $(AXP64) || $(IA64)
+TARGETLIBS=$(TARGETLIBS) $(CRT_LIB_PATH)\libcntpr.lib
+!ENDIF
+
+MSC_WARNING_LEVEL=/W3 /WX
+
+# Platform-specific source files
+!IF $(ALPHA)
+SOURCES=nvme2k.c       \
+        utils.c        \
+        nvme2k.rc
+
+!ELSE
+SOURCES=nvme2k.c       \
+        utils.c        \
+        nvme2k.rc
+!ENDIF
+
