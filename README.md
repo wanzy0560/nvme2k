@@ -12,7 +12,7 @@ It seemed like a good idea at first.
 
 ## Features
 
-- **Full NVMe 1.0 specification support**
+- **NVMe 1.0 specification support**
   - Single I/O queue pair (scalable architecture)
   - Admin queue for device management
   - PRP (Physical Region Page) based data transfers
@@ -25,9 +25,7 @@ It seemed like a good idea at first.
   - READ/WRITE/FLUSH/INQUIRY/READ_CAPACITY commands
 
 - **Advanced Features**
-  - SMP-safe with configurable locking (`NVME2K_USE_*_LOCK` defines)
-  - Custom atomic operations for x86 and Alpha AXP
-  - Proper alignment for Alpha 64-bit pointers
+  - Proper alignment for Alpha
   - Non-tagged request serialization
   - Queue depth management and statistics
 
@@ -51,8 +49,10 @@ Application Layer
 
 ### Key Components
 
-- **atomic.h** - Platform-specific atomic operations (x86 inline asm, Alpha LL/SC)
-- **nvme2k.c** - Main driver logic, SCSI translation, NVMe command handling
+- **nvme2k.c** - Main driver logic
+- **nvme2k_nvme.c** - NVMe controller logic
+- **nvme2k_scsi.c** - SCSI command handling
+- **nvme2k_cpl.c** - NVMe completion handling
 - **nvme2k.h** - Data structures, constants, NVMe register definitions
 - **nvme2k.inf** - Multi-platform installation file
 
@@ -62,7 +62,7 @@ Application Layer
 
 - **Windows 2000 DDK**
   - Final version (5.00.2195.1) for x86
-  - RC1 version for Alpha AXP
+  - RC1 version for Alpha AXP (does anyone have RC2 besides hoarders at betanews?)
 
 - **Visual C++ 6.0**
   - x86 compiler for x86 builds
@@ -75,7 +75,7 @@ Application Layer
 ```cmd
 REM Set up build environment
 cd C:\NTDDK\bin
-setenv.bat free          REM or 'checked' for debug build
+setenv.bat C:\NTDDK free          REM or 'checked' for debug build
 
 REM Navigate to driver directory
 cd <path-to-nvme2k>
@@ -91,7 +91,7 @@ Output: `obj\i386\nvme2k.sys`
 ```cmd
 REM Set up build environment for Alpha
 cd C:\NTDDK\bin
-setenv.bat free alpha    REM or 'checked' for debug build
+setenv.bat C:\NTDDK free    REM or 'checked' for debug build
 
 REM Navigate to driver directory
 cd <path-to-nvme2k>
@@ -110,10 +110,6 @@ Edit `nvme2k.h` to configure:
 #define NVME2K_DBG                    // Enable debug logging
 // #define NVME2K_DBG_CMD             // Extra verbose command logging
 
-// Locking control (comment out to disable)
-#define NVME2K_USE_INTERRUPT_LOCK     // Serialize HwInterrupt on SMP
-#define NVME2K_USE_SUBMISSION_LOCK    // Serialize command submission
-#define NVME2K_USE_COMPLETION_LOCK    // Serialize completion processing
 ```
 
 ## Installation
@@ -173,12 +169,7 @@ Debug messages are output via `ScsiDebugPrint()` and visible in checked builds.
 
 ### Synchronization Model
 
-The driver uses multiple synchronization strategies:
-
-1. **InterruptLock** - Prevents concurrent ISR execution on SMP systems
-2. **SubmissionLock** - Protects submission queue tail pointer
-3. **CompletionLock** - Serializes completion queue processing
-4. **NonTaggedInFlight** - Ensures only one non-tagged request at a time
+1. **NonTaggedInFlight** - Ensures only one non-tagged request at a time
 
 All locks can be disabled via `#define` for performance testing.
 
@@ -195,6 +186,9 @@ All locks can be disabled via `#define` for performance testing.
 Bit 15: Non-tagged flag (1 = non-tagged, 0 = tagged)
 Bit 14: Ordered flush flag (for ORDERED queue tags)
 Bits 0-13: QueueTag (tagged) or sequence number (non-tagged)
+For admin queue command get log page, PRP slot is added to base CID
+so we dont leak them if SRB is not available. For some reason SCSIPORT doesn't
+return SRB when we ask it for SMART commands.
 ```
 
 ## License
@@ -216,7 +210,7 @@ This project is licensed under the **3-Clause BSD License**. See the [LICENSE](L
 Feel free to submit issues or pull requests. Areas of interest:
 
 - Multi-queue support
-- MSI-X interrupt support
+- MSI-X interrupt support (is it even possible?)
 - Power management
 - Additional SCSI command translations
 - Performance optimizations
@@ -230,4 +224,4 @@ Feel free to submit issues or pull requests. Areas of interest:
 
 ---
 
-**Disclaimer:** This is an unofficial, community-developed driver. Not affiliated with Microsoft, Intel, or the NVMe standards body.
+**Disclaimer:** This is an unofficial, community-developed driver. Not affiliated with any company or the NVMe standards body.

@@ -15,11 +15,17 @@ MSC_WARNING_LEVEL=/W3 /WX
 # Platform-specific source files
 !IF $(ALPHA)
 SOURCES=nvme2k.c       \
+        nvme2k_cpl.c   \
+        nvme2k_nvme.c  \
+        nvme2k_scsi.c  \
         utils.c        \
         nvme2k.rc
 
 !ELSE
 SOURCES=nvme2k.c       \
+        nvme2k_cpl.c   \
+        nvme2k_nvme.c  \
+        nvme2k_scsi.c  \
         utils.c        \
         nvme2k.rc
 !ENDIF

@@ -5,8 +5,6 @@
 #ifndef _NVME2K_UTILS_H_
 #define _NVME2K_UTILS_H_
 
-#include <miniport.h>
-
 // Forward declare to avoid circular dependency if nvme2k.h includes utils.h first
 struct _NVME_SMART_INFO;
 struct _ATA_SMART_DATA;
@@ -42,10 +40,8 @@ struct _ATA_SMART_DATA;
 
 
 ULONG RtlCompareMemory(IN CONST VOID *Source1, IN CONST VOID *Source2, IN ULONG Length);
-
 VOID NvmeSmartToAtaSmart(IN struct _NVME_SMART_INFO *NvmeSmart, OUT struct _ATA_SMART_DATA *AtaSmart);
-
-// Include after forward declarations to resolve types
-#include "nvme2k.h"
+BOOLEAN NvmeGetLogPage(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN UCHAR LogPageId);
+ULONG log2(ULONG n);
 
 #endif // _NVME2K_UTILS_H_
