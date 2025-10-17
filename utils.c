@@ -743,15 +743,32 @@ BOOLEAN IsNvmeDevice(UCHAR BaseClass, UCHAR SubClass, UCHAR ProgIf)
 }
 
 //
-// ReadPciConfigWord - Read 16-bit value from PCI config space
+// ReadPciConfigByte - Read 8-bit value from PCI config space
 //
-USHORT ReadPciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset)
+UCHAR ReadPciConfigByte(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 {
-    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
     UCHAR buffer[256];
 
     ScsiPortGetBusData(
-        DeviceExtension,
+        (PVOID)DevExt,
+        PCIConfiguration,
+        DevExt->BusNumber,
+        DevExt->SlotNumber,
+        buffer,
+        256);
+
+    return buffer[Offset];
+}
+
+//
+// ReadPciConfigWord - Read 16-bit value from PCI config space
+//
+USHORT ReadPciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
+{
+    UCHAR buffer[256];
+
+    ScsiPortGetBusData(
+        (PVOID)DevExt,
         PCIConfiguration,
         DevExt->BusNumber,
         DevExt->SlotNumber,
@@ -764,13 +781,12 @@ USHORT ReadPciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset)
 //
 // ReadPciConfigDword - Read 32-bit value from PCI config space
 //
-ULONG ReadPciConfigDword(IN PVOID DeviceExtension, IN ULONG Offset)
+ULONG ReadPciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset)
 {
-    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
     UCHAR buffer[256];
 
     ScsiPortGetBusData(
-        DeviceExtension,
+        (PVOID)DevExt,
         PCIConfiguration,
         DevExt->BusNumber,
         DevExt->SlotNumber,
@@ -783,12 +799,10 @@ ULONG ReadPciConfigDword(IN PVOID DeviceExtension, IN ULONG Offset)
 //
 // WritePciConfigWord - Write 16-bit value to PCI config space
 //
-VOID WritePciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset, IN USHORT Value)
+VOID WritePciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN USHORT Value)
 {
-    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
-
     ScsiPortSetBusDataByOffset(
-        DeviceExtension,
+        (PVOID)DevExt,
         PCIConfiguration,
         DevExt->BusNumber,
         DevExt->SlotNumber,
@@ -800,12 +814,10 @@ VOID WritePciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset, IN USHORT Val
 //
 // WritePciConfigDword - Write 32-bit value to PCI config space
 //
-VOID WritePciConfigDword(IN PVOID DeviceExtension, IN ULONG Offset, IN ULONG Value)
+VOID WritePciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN ULONG Value)
 {
-    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
-
     ScsiPortSetBusDataByOffset(
-        DeviceExtension,
+        (PVOID)DevExt,
         PCIConfiguration,
         DevExt->BusNumber,
         DevExt->SlotNumber,

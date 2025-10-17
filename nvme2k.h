@@ -65,6 +65,8 @@
 #define PCI_BASE_ADDRESS_0                  0x10
 #define PCI_SUBSYSTEM_VENDOR_ID_OFFSET      0x2C
 #define PCI_SUBSYSTEM_ID_OFFSET             0x2E
+#define PCI_INTERRUPT_LINE_OFFSET           0x3C
+#define PCI_INTERRUPT_PIN_OFFSET            0x3D
 
 //
 // PCI Command Register bits
@@ -165,6 +167,22 @@
 #define SCSI_LOG_PAGE_START_STOP        0x0E
 #define SCSI_LOG_PAGE_SELF_TEST         0x10
 #define SCSI_LOG_PAGE_INFORMATIONAL     0x2F
+
+// These are missing from NT4 DDK
+#ifndef MODE_PAGE_POWER_CONDITION
+#define MODE_PAGE_POWER_CONDITION       0x1A
+#endif
+
+#ifndef MODE_PAGE_FAULT_REPORTING
+#define MODE_PAGE_FAULT_REPORTING       0x1C
+#endif
+
+#ifndef IOCTL_SCSI_FREE_DUMP_POINTERS
+#define IOCTL_SCSI_FREE_DUMP_POINTERS   CTL_CODE(IOCTL_SCSI_BASE, 0x0409, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef IOCTL_IDE_PASS_THROUGH
+#define IOCTL_IDE_PASS_THROUGH          CTL_CODE(IOCTL_SCSI_BASE, 0x040a, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#endif
 
 //
 // READ DEFECT DATA (10) CDB structure
@@ -810,18 +828,25 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension);
 BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
 BOOLEAN HwInterrupt(IN PVOID DeviceExtension);
 BOOLEAN HwResetBus(IN PVOID DeviceExtension, IN ULONG PathId);
+#if (_WIN32_WINNT >= 0x500)
 SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(IN PVOID DeviceExtension,
                                               IN SCSI_ADAPTER_CONTROL_TYPE ControlType,
                                               IN PVOID Parameters);
-
+#else
+VOID HwAdapterState(
+    IN PVOID DeviceExtension,
+    IN PVOID Context,
+    IN BOOLEAN SaveState);
+#endif
 //
 // Helper functions
 //
 BOOLEAN IsNvmeDevice(UCHAR BaseClass, UCHAR SubClass, UCHAR ProgIf);
-USHORT ReadPciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset);
-ULONG ReadPciConfigDword(IN PVOID DeviceExtension, IN ULONG Offset);
-VOID WritePciConfigWord(IN PVOID DeviceExtension, IN ULONG Offset, IN USHORT Value);
-VOID WritePciConfigDword(IN PVOID DeviceExtension, IN ULONG Offset, IN ULONG Value);
+UCHAR ReadPciConfigByte(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset);
+USHORT ReadPciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset);
+ULONG ReadPciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset);
+VOID WritePciConfigWord(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN USHORT Value);
+VOID WritePciConfigDword(IN PHW_DEVICE_EXTENSION DevExt, IN ULONG Offset, IN ULONG Value);
 
 //
 // NVMe helper functions

@@ -4,6 +4,7 @@
 
 #include "nvme2k.h"
 #include "utils.h"
+
 //
 // DriverEntry - Main entry point
 //
@@ -11,7 +12,9 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
     HW_INITIALIZATION_DATA hwInitData;
     ULONG status;
-
+#if (_WIN32_WINNT < 0x500)
+    ULONG HwContext[2];
+#endif
     // Break into debugger if attached
 
 #ifdef NVME2K_DBG
@@ -31,13 +34,17 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     hwInitData.HwInterrupt = HwInterrupt;
     hwInitData.HwFindAdapter = HwFindAdapter;
     hwInitData.HwResetBus = HwResetBus;
+#if (_WIN32_WINNT >= 0x500)
     hwInitData.HwAdapterControl = HwAdapterControl;
+#else
+    hwInitData.HwAdapterState = HwAdapterState;
+#endif
 
     // Set driver-specific parameters
     hwInitData.AdapterInterfaceType = PCIBus;  // Change as needed
     hwInitData.DeviceExtensionSize = sizeof(HW_DEVICE_EXTENSION);
     hwInitData.SpecificLuExtensionSize = 0;
-    hwInitData.SrbExtensionSize = 0;
+    hwInitData.SrbExtensionSize = sizeof(NVME_SRB_EXTENSION);  // Required for PRP list tracking
     hwInitData.NumberOfAccessRanges = 1;
     hwInitData.MapBuffers = TRUE;
     hwInitData.NeedPhysicalAddresses = TRUE;
@@ -51,9 +58,19 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     hwInitData.DeviceIdLength = 0;
     hwInitData.DeviceId = NULL;
 
+#if (_WIN32_WINNT < 0x500)
+    HwContext[0] = 0;
+    HwContext[1] = 0;
+#endif
     // Call port driver
     status = ScsiPortInitialize(DriverObject, Argument2,
-                                &hwInitData, NULL);
+                                &hwInitData, 
+#if (_WIN32_WINNT >= 0x500)
+                                NULL
+#else
+                                HwContext
+#endif
+                            );
 
 #ifdef NVME2K_DBG
     ScsiDebugPrint(0, "nvme2k: DriverEntry exiting with status 0x%08X\n", status);
@@ -61,118 +78,67 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     return status;
 }
 
-//
-// HwFindAdapter - Locate and configure the adapter
-//
-ULONG HwFindAdapter(
-    IN PVOID DeviceExtension,
-    IN PVOID HwContext,
-    IN PVOID BusInformation,
-    IN PCHAR ArgumentString,
+ULONG HwFoundAdapter(
+    IN PHW_DEVICE_EXTENSION DevExt,
     IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
-    OUT PBOOLEAN Again)
+    IN PUCHAR pciBuffer)
 {
-    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
     PACCESS_RANGE accessRange;
-    PCI_SLOT_NUMBER slotData;
-    UCHAR pciBuffer[256];
-    ULONG slotNumber;
-    ULONG busNumber;
-    UCHAR baseClass, subClass, progIf;
-    BOOLEAN deviceFound = FALSE;
-    ULONG bytesRead;
     ULONG bar0;
     ULONG barSize;
-    UCHAR tempBuffer[256];
     ULONG tempSize;
 
 #ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter called\n");
-#endif
-    // Initialize for PCI scanning
-    slotData.u.AsULONG = 0;
-    
-    // Start scanning from where we left off
-    if (HwContext != NULL) {
-        busNumber = ((PULONG)HwContext)[0];
-        slotNumber = ((PULONG)HwContext)[1];
-    } else {
-        busNumber = ConfigInfo->SystemIoBusNumber;
-        slotNumber = 0;
-    }
-
-    // Scan PCI bus for NVMe devices
-    for (; busNumber < 256 && !deviceFound; busNumber++) {
-        for (; slotNumber < PCI_MAX_DEVICES * PCI_MAX_FUNCTION; slotNumber++) {
-            slotData.u.AsULONG = slotNumber;
-
-            // Read PCI configuration space
-            bytesRead = ScsiPortGetBusData(
-                DeviceExtension,
-                PCIConfiguration,
-                busNumber,
-                slotNumber,
-                pciBuffer,
-                256);
-
-            if (bytesRead == 0) {
-                continue;  // No device in this slot
-            }
-
-            // Extract Vendor ID and Device ID
-            DevExt->VendorId = *(USHORT*)&pciBuffer[PCI_VENDOR_ID_OFFSET];
-            DevExt->DeviceId = *(USHORT*)&pciBuffer[PCI_DEVICE_ID_OFFSET];
-
-            // Check for invalid vendor ID
-            if (DevExt->VendorId == 0xFFFF || DevExt->VendorId == 0x0000) {
-                continue;
-            }
-
-            // Extract class code information
-            DevExt->RevisionId = pciBuffer[PCI_REVISION_ID_OFFSET];
-            progIf = pciBuffer[PCI_CLASS_CODE_OFFSET];
-            subClass = pciBuffer[PCI_CLASS_CODE_OFFSET + 1];
-            baseClass = pciBuffer[PCI_CLASS_CODE_OFFSET + 2];
-
-#ifdef NVME2K_DBG
-            ScsiDebugPrint(0, "nvme2k: HwFindAdapter - checking bus %d slot %d: VID=%04X DID=%04X Class=%02X%02X%02X\n",
-                           busNumber, slotNumber, DevExt->VendorId, DevExt->DeviceId,
-                           baseClass, subClass, progIf);
-#endif
-            // Check if this is an NVMe device
-            if (IsNvmeDevice(baseClass, subClass, progIf)) {
-                deviceFound = TRUE;
-                DevExt->BusNumber = busNumber;
-                DevExt->SlotNumber = slotNumber;
-                break;
-            }
-        }
-        
-        if (deviceFound) {
-            break;
-        }
-        slotNumber = 0;  // Reset slot for next bus
-    }
-
-    if (!deviceFound) {
-        *Again = FALSE;
-#ifdef NVME2K_DBG
-        ScsiDebugPrint(0, "nvme2k: HwFindAdapter - no NVMe device found\n");
-#endif
-        return SP_RETURN_NOT_FOUND;
-    }
-
-#ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - found device VID=%04X DID=%04X at bus %d slot %d\n",
+    ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - found NVMe device VID=%04X DID=%04X at bus %d slot %d\n",
                    DevExt->VendorId, DevExt->DeviceId, DevExt->BusNumber, DevExt->SlotNumber);
 #endif
+
     // Read subsystem IDs using helper function
-    DevExt->SubsystemVendorId = ReadPciConfigWord(DeviceExtension, PCI_SUBSYSTEM_VENDOR_ID_OFFSET);
-    DevExt->SubsystemId = ReadPciConfigWord(DeviceExtension, PCI_SUBSYSTEM_ID_OFFSET);
+    DevExt->SubsystemVendorId = ReadPciConfigWord(DevExt, PCI_SUBSYSTEM_VENDOR_ID_OFFSET);
+    DevExt->SubsystemId = ReadPciConfigWord(DevExt, PCI_SUBSYSTEM_ID_OFFSET);
 
     // Enable PCI device (Bus Master, Memory Space)
-    WritePciConfigWord(DeviceExtension, PCI_COMMAND_OFFSET, 
+    WritePciConfigWord(DevExt, PCI_COMMAND_OFFSET,
                       PCI_ENABLE_BUS_MASTER | PCI_ENABLE_MEMORY_SPACE);
+
+    // Read interrupt configuration from PCI config space
+    // This is probably redundant on Win2K and can be ifdefed out
+    {
+        UCHAR interruptLine = ReadPciConfigByte(DevExt, PCI_INTERRUPT_LINE_OFFSET);
+        UCHAR interruptPin = ReadPciConfigByte(DevExt, PCI_INTERRUPT_PIN_OFFSET);
+
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - PCI Interrupt Line=%d Pin=%d\n",
+                       interruptLine, interruptPin);
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - ConfigInfo BEFORE: BusInterruptLevel=%d Vector=%d Mode=%d\n",
+                       ConfigInfo->BusInterruptLevel, ConfigInfo->BusInterruptVector, ConfigInfo->InterruptMode);
+#endif
+
+        // CRITICAL FOR NT4: When manually setting SystemIoBusNumber/SlotNumber,
+        // SCSI port doesn't automatically query interrupt configuration from HAL.
+        // We MUST set valid interrupt parameters or we'll get STATUS_INVALID_PARAMETER.
+        // For PCI: BusInterruptLevel = interrupt line, mode = LevelSensitive
+        if (interruptPin != 0 && interruptLine != 0 && interruptLine != 0xFF) {
+            ConfigInfo->BusInterruptLevel = interruptLine;
+            ConfigInfo->BusInterruptVector = interruptLine;
+            ConfigInfo->InterruptMode = LevelSensitive;
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - Set interrupt from PCI config: Level=%d\n", interruptLine);
+#endif
+        } else {
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - WARNING: No valid PCI interrupt configured\n");
+#endif
+            // If no valid interrupt, still need to set something valid for NT4
+            // Use polling mode - but this might not work on NT4!
+            ConfigInfo->BusInterruptLevel = 0;
+            ConfigInfo->BusInterruptVector = 0;
+        }
+    }
+
+    // Set the number of access ranges we're using (1 for BAR0)
+    // NT4 may require this to be explicitly set for resource translation
+    ConfigInfo->NumberOfAccessRanges = 1;
 
     // Configure the adapter settings
     // With PRP lists, we can support up to 512 entries per list = 2MB per transfer
@@ -184,7 +150,9 @@ ULONG HwFindAdapter(
     ConfigInfo->CachesData = FALSE;
     ConfigInfo->AdapterScansDown = FALSE;
     ConfigInfo->Dma32BitAddresses = TRUE;
+#if (_WIN32_WINNT >= 0x500)
     ConfigInfo->Dma64BitAddresses = TRUE;  // NVMe supports 64-bit addressing
+#endif    
     ConfigInfo->MaximumNumberOfTargets = 2;  // Support TargetId 0 and 1
     ConfigInfo->NumberOfPhysicalBreaks = 511;  // PRP1 + PRP list (512 entries)
     ConfigInfo->AlignmentMask = 0x3;  // DWORD alignment
@@ -192,14 +160,29 @@ ULONG HwFindAdapter(
     ConfigInfo->TaggedQueuing = TRUE;  // Support tagged command queuing
     ConfigInfo->MultipleRequestPerLu = TRUE;  // Allow multiple outstanding commands per LUN
     ConfigInfo->AutoRequestSense = TRUE;  // Automatically provide sense data on errors
-    ConfigInfo->SrbExtensionSize = sizeof(NVME_SRB_EXTENSION);  // Per-SRB data for PRP list tracking
+    // Note: SrbExtensionSize must be set in HW_INITIALIZATION_DATA, not here
 
+#ifdef NVME2K_DBG_EXTRA
+    {
+        ULONG a;
+        accessRange = &((*(ConfigInfo->AccessRanges))[0]);
+        for (a = 0; a < ConfigInfo->NumberOfAccessRanges; a++) {
+            ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - range:%u start:%08X, length:%08X, inMemory:%d\n",
+                           a, (ULONG)(accessRange->RangeStart.QuadPart),
+                           accessRange->RangeLength,
+                           accessRange->RangeInMemory);
+            accessRange++;
+        }
+    }
+#endif
+    // Again, most of this BAR dance has been already done by Win2k PnP
+    // We can probably ifdef it out on Win2k
     // Get BAR0 (Controller registers for NVMe)
     accessRange = &((*(ConfigInfo->AccessRanges))[0]);
     accessRange->RangeStart = ScsiPortConvertUlongToPhysicalAddress(0);
     accessRange->RangeLength = 0;
 
-    bar0 = ReadPciConfigDword(DeviceExtension, PCI_BASE_ADDRESS_0);
+    bar0 = ReadPciConfigDword(DevExt, PCI_BASE_ADDRESS_0);
 
     if (bar0 & 0x1) {
         // I/O Space (unlikely for NVMe but handle it)
@@ -211,13 +194,13 @@ ULONG HwFindAdapter(
         accessRange->RangeInMemory = TRUE;
     }
 
-    WritePciConfigDword(DeviceExtension, PCI_BASE_ADDRESS_0, 0xFFFFFFFF);
+    WritePciConfigDword(DevExt, PCI_BASE_ADDRESS_0, 0xFFFFFFFF);
 
     // Read back the modified value
-    barSize = ReadPciConfigDword(DeviceExtension, PCI_BASE_ADDRESS_0);
+    barSize = ReadPciConfigDword(DevExt, PCI_BASE_ADDRESS_0);
 
     // Restore original BAR value
-    WritePciConfigDword(DeviceExtension, PCI_BASE_ADDRESS_0, bar0);
+    WritePciConfigDword(DevExt, PCI_BASE_ADDRESS_0, bar0);
 
     // Calculate size
     // The size is the bitwise NOT of the value read back (ignoring type bits), plus one.
@@ -230,14 +213,30 @@ ULONG HwFindAdapter(
     DevExt->ControllerRegistersLength = accessRange->RangeLength;
 
 #ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - BAR0 base=0x%08X size=0x%08X %s\n",
+    ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - BAR0 base=0x%08X size=0x%08X %s\n",
                    (ULONG)accessRange->RangeStart.QuadPart,
                    accessRange->RangeLength,
                    accessRange->RangeInMemory ? "Memory" : "I/O");
 #endif
+
+    // Validate the access range (required for NT4, optional for Win2K+)
+    // This checks if the range is available and doesn't conflict with other devices
+    if (!ScsiPortValidateRange(
+            (PVOID)DevExt,
+            ConfigInfo->AdapterInterfaceType,
+            ConfigInfo->SystemIoBusNumber,
+            accessRange->RangeStart,
+            accessRange->RangeLength,
+            (BOOLEAN)!accessRange->RangeInMemory)) {
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - ScsiPortValidateRange failed for BAR0\n");
+#endif
+        return SP_RETURN_ERROR;
+    }
+
     // Map the controller registers
     DevExt->ControllerRegisters = ScsiPortGetDeviceBase(
-        DeviceExtension,
+        (PVOID)DevExt,
         ConfigInfo->AdapterInterfaceType,
         ConfigInfo->SystemIoBusNumber,
         accessRange->RangeStart,
@@ -246,7 +245,7 @@ ULONG HwFindAdapter(
 
     if (DevExt->ControllerRegisters == NULL) {
 #ifdef NVME2K_DBG
-        ScsiDebugPrint(0, "nvme2k: HwFindAdapter - failed to map controller registers\n");
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - failed to map controller registers\n");
 #endif
         return SP_RETURN_ERROR;
     }
@@ -279,13 +278,13 @@ ULONG HwFindAdapter(
     DevExt->UncachedExtensionSize = UNCACHED_EXTENSION_SIZE;
 
     DevExt->UncachedExtensionBase = ScsiPortGetUncachedExtension(
-        DeviceExtension,
+        (PVOID)DevExt,
         ConfigInfo,
         DevExt->UncachedExtensionSize);
 
     if (DevExt->UncachedExtensionBase == NULL) {
 #ifdef NVME2K_DBG
-        ScsiDebugPrint(0, "nvme2k: HwFindAdapter - failed to allocate uncached memory\n");
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - failed to allocate uncached memory\n");
 #endif
         return SP_RETURN_ERROR;
     }
@@ -293,7 +292,7 @@ ULONG HwFindAdapter(
     // Get physical address of the entire uncached block
     tempSize = DevExt->UncachedExtensionSize;
     DevExt->UncachedExtensionPhys = ScsiPortGetPhysicalAddress(
-        DeviceExtension,
+        (PVOID)DevExt,
         NULL,
         DevExt->UncachedExtensionBase,
         &tempSize);
@@ -305,28 +304,142 @@ ULONG HwFindAdapter(
     DevExt->UncachedExtensionOffset = 0;
 
 #ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - allocated %u bytes of uncached memory at virt=%p phys=%08X%08X\n",
+    ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - allocated %u bytes of uncached memory at virt=%p phys=%08X%08X\n",
                    DevExt->UncachedExtensionSize, DevExt->UncachedExtensionBase,
                    (ULONG)(DevExt->UncachedExtensionPhys.QuadPart >> 32),
                    (ULONG)(DevExt->UncachedExtensionPhys.QuadPart & 0xFFFFFFFF));
 #endif
-    // Check if there are more devices to scan
-    if (busNumber < 255 || slotNumber < (PCI_MAX_DEVICES * PCI_MAX_FUNCTION - 1)) {
-        *Again = TRUE;
-        // Save context for next call
-        if (HwContext == NULL) {
-            HwContext = &ConfigInfo->SystemIoBusNumber;
-        }
-        ((PULONG)HwContext)[0] = busNumber;
-        ((PULONG)HwContext)[1] = slotNumber + 1;
-    } else {
-        *Again = FALSE;
-    }
 
 #ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - success, returning SP_RETURN_FOUND\n");
+    ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - success, returning SP_RETURN_FOUND\n");
 #endif
     return SP_RETURN_FOUND;
+}
+
+//
+// HwFindAdapter - Locate and configure the adapter
+//
+ULONG HwFindAdapter(
+    IN PVOID DeviceExtension,
+    IN PVOID HwContext,
+    IN PVOID BusInformation,
+    IN PCHAR ArgumentString,
+    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
+    OUT PBOOLEAN Again)
+{
+    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
+    UCHAR pciBuffer[256];
+    ULONG slotNumber;
+    ULONG busNumber;
+    UCHAR baseClass, subClass, progIf;
+    ULONG bytesRead;
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwFindAdapter:%p called - Bus=%d Slot=%d\n",
+                   DeviceExtension, ConfigInfo->SystemIoBusNumber, ConfigInfo->SlotNumber);
+#endif
+
+    if (HwContext) {
+        busNumber = ((PULONG)HwContext)[0];
+        slotNumber = ((PULONG)HwContext)[1];
+    } else {
+        // Win2k, PnP gives us this directly
+        busNumber = ConfigInfo->SystemIoBusNumber;
+        slotNumber = ConfigInfo->SlotNumber;
+    }
+scanloop:
+    // Read PCI configuration space for THIS slot only
+    bytesRead = ScsiPortGetBusData(
+        DeviceExtension,
+        PCIConfiguration,
+        busNumber,
+        slotNumber,
+        pciBuffer,
+        256);
+
+    if (bytesRead == 0) {
+        // No device in this slot - tell SCSI port to keep scanning other slots
+        goto scannext;
+    }
+
+    // Extract Vendor ID and Device ID
+    DevExt->VendorId = *(USHORT*)&pciBuffer[PCI_VENDOR_ID_OFFSET];
+    DevExt->DeviceId = *(USHORT*)&pciBuffer[PCI_DEVICE_ID_OFFSET];
+
+    // Check for invalid vendor ID
+    if (DevExt->VendorId == 0xFFFF || DevExt->VendorId == 0x0000) {
+        // No valid device in this slot - tell SCSI port to keep scanning other slots
+        goto scannext;
+    }
+
+    // Extract class code information
+    DevExt->RevisionId = pciBuffer[PCI_REVISION_ID_OFFSET];
+    progIf = pciBuffer[PCI_CLASS_CODE_OFFSET];
+    subClass = pciBuffer[PCI_CLASS_CODE_OFFSET + 1];
+    baseClass = pciBuffer[PCI_CLASS_CODE_OFFSET + 2];
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - bus %d slot %d: VID=%04X DID=%04X Class=%02X%02X%02X\n",
+                   busNumber, slotNumber, DevExt->VendorId, DevExt->DeviceId,
+                   baseClass, subClass, progIf);
+#endif
+
+    // Check if this is an NVMe device
+    if (IsNvmeDevice(baseClass, subClass, progIf)) {
+        // Found an NVMe device at the slot SCSI port asked us to check!
+        DevExt->BusNumber = busNumber;
+        DevExt->SlotNumber = slotNumber;
+        // Store next slot/bus so we can resume scanning on next call
+        if (HwContext) {
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwFindAdapter - NT4: store HwContext to resume scanning\n");
+#endif
+            ((PULONG)HwContext)[0] = DevExt->BusNumber;
+            ((PULONG)HwContext)[1] = DevExt->SlotNumber + 1;
+            if (((PULONG)HwContext)[1] >= (PCI_MAX_DEVICES*PCI_MAX_FUNCTION)) {
+                ((PULONG)HwContext)[1] = 0;
+                ((PULONG)HwContext)[0]++;
+            }
+        }
+#if (_WIN32_WINNT < 0x500)
+#ifdef NVME2K_DBG
+        if (!HwContext) {
+            ScsiDebugPrint(0, "nvme2k: HwFindAdapter - uh oh no HwContext! are we going to scan whole thing again?\n");
+        }
+#endif
+        // NT4: Set Again=TRUE to allow detection of multiple NVMe controllers
+        *Again = TRUE;
+#else
+        // Win2K+: PnP will call us again for each device, no need for Again
+        *Again = FALSE;
+#endif
+        return HwFoundAdapter(DevExt, ConfigInfo, pciBuffer);
+    }
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwFindAdapter - not an NVMe device\n");
+#endif
+
+scannext:
+#if (_WIN32_WINNT >= 0x500)
+    // Win2K+: PnP gave us a specific device - don't scan if it's not NVMe
+    if (HwContext == NULL) {
+        *Again = FALSE;
+        return SP_RETURN_NOT_FOUND;
+    }
+#endif
+    // NT4: Continue scanning the bus
+    slotNumber++;
+    if (slotNumber == (PCI_MAX_DEVICES*PCI_MAX_FUNCTION)) {
+        busNumber++;
+        slotNumber = 0;
+        if (busNumber == 16) { // theoretically 256 but we arent going to waste cycles
+#if (_WIN32_WINNT < 0x500)
+            *Again = FALSE;
+#endif
+            return SP_RETURN_NOT_FOUND;
+        }
+    }
+    goto scanloop;
 }
 
 //
@@ -338,6 +451,9 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
     ULONG cc, aqa;
     ULONG pageShift;
 
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize called\n");
+#endif
     // Read controller capabilities
     DevExt->ControllerCapabilities = NvmeReadReg64(DevExt, NVME_REG_CAP);
     DevExt->Version = NvmeReadReg32(DevExt, NVME_REG_VS);
@@ -818,8 +934,9 @@ BOOLEAN HwResetBus(IN PVOID DeviceExtension, IN ULONG PathId)
     return TRUE;
 }
 
+#if (_WIN32_WINNT >= 0x500)
 //
-// HwAdapterControl - Handle adapter power and PnP events
+// HwAdapterControl - Handle adapter power and PnP events (Windows 2000+)
 //
 SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(
     IN PVOID DeviceExtension,
@@ -835,9 +952,9 @@ SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(
     switch (ControlType) {
         case ScsiQuerySupportedControlTypes:
             {
-                PSCSI_SUPPORTED_CONTROL_TYPE_LIST list = 
+                PSCSI_SUPPORTED_CONTROL_TYPE_LIST list =
                     (PSCSI_SUPPORTED_CONTROL_TYPE_LIST)Parameters;
-                
+
                 // Indicate which control types we support
                 list->SupportedTypeList[ScsiStopAdapter] = TRUE;
                 list->SupportedTypeList[ScsiRestartAdapter] = TRUE;
@@ -872,4 +989,36 @@ SCSI_ADAPTER_CONTROL_STATUS HwAdapterControl(
 
     return status;
 }
+#else
+//
+// HwAdapterState - Handle adapter state changes (Windows NT 4)
+//
+VOID HwAdapterState(
+    IN PVOID DeviceExtension,
+    IN PVOID Context,
+    IN BOOLEAN SaveState)
+{
+    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwAdapterState called - SaveState=%d\n", SaveState);
+#endif
+
+    if (SaveState) {
+        // Save adapter state - prepare for power down or hibernation
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwAdapterState - saving state and shutting down\n");
+#endif
+        // Perform clean shutdown of the NVMe controller
+        NvmeShutdownController(DevExt);
+    } else {
+        // Restore adapter state - reinitialize after power up
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwAdapterState - restoring state\n");
+#endif
+        // Reinitialize the controller
+        HwInitialize(DevExt);
+    }
+}
+#endif
  

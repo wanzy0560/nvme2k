@@ -489,7 +489,7 @@ BOOLEAN ScsiHandleModeSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
 #endif
 
     buffer = (PUCHAR)Srb->DataBuffer;
-    isModeSense10 = (cdb->AsByte[0] == SCSIOP_MODE_SENSE10);
+    isModeSense10 = (Srb->Cdb[0] == SCSIOP_MODE_SENSE10);
 
     // Parse the CDB based on command type
     if (isModeSense10) {
