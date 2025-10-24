@@ -266,7 +266,10 @@ installtheoption = +
                 {BusType, 0, $(!REG_VT_DWORD), 5}  +
                 }
 
-        set DeviceValues     = {}
+        set DeviceValues     = { +
+                {NumberOfRequests, 0, $(!REG_VT_DWORD), 32}, +
+                {MaximumSGList, 0, $(!REG_VT_DWORD), 512}  +
+                }
 
         set EventLogValues   = { +
                 {EventMessageFile, 0, $(!REG_VT_EXPAND_SZ), $(EventMessageFile) }, +

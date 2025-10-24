@@ -183,12 +183,12 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
         // Non-tagged request - only one can be in flight at a time
         if (DevExt->NonTaggedInFlight) {
 #ifdef NVME2K_DBG
-            ScsiDebugPrint(0, "nvme2k: Non-tagged request rejected - another non-tagged request in flight\n");
+            ScsiDebugPrint(0, "nvme2k: Non-tagged request rejected - another non-tagged request in flight tag:%02X\n", Srb->QueueTag);
 #endif
             return ScsiBusy(DevExt, Srb);
         }
         // Mark that we now have a non-tagged request in flight
-        DevExt->NonTaggedInFlight = TRUE;
+        DevExt->NonTaggedInFlight = Srb;
     }
 
 #ifdef NVME2K_DBG_EXTRA
@@ -235,7 +235,11 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
 
     // Build the NVMe Read/Write command from the SCSI CDB.
     RtlZeroMemory(&nvmeCmd, sizeof(NVME_COMMAND));
-    NvmeBuildReadWriteCommand(DevExt, Srb, &nvmeCmd, commandId);
+    if (!NvmeBuildReadWriteCommand(DevExt, Srb, &nvmeCmd, commandId)) {
+        // most likely couldnt get memory for PRP list
+        DevExt->NonTaggedInFlight = NULL;
+        return ScsiBusy(DevExt, Srb);
+    }
 
     // Submit the command to the I/O queue.
     if (NvmeSubmitIoCommand(DevExt, &nvmeCmd)) {
@@ -247,6 +251,7 @@ BOOLEAN ScsiHandleReadWrite(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
             FreePrpListPage(DevExt, srbExt->PrpListPage);
             srbExt->PrpListPage = 0xFF;
         }
+        DevExt->NonTaggedInFlight = NULL;
         return ScsiBusy(DevExt, Srb);
     }
 }
@@ -384,8 +389,7 @@ BOOLEAN ScsiHandleFlush(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
             return ScsiBusy(DevExt, Srb);
         }
         // Mark that we now have a non-tagged request in flight
-        DevExt->NonTaggedInFlight = TRUE;
-        DevExt->NonTaggedSrbFallback = Srb;
+        DevExt->NonTaggedInFlight = Srb;
     }
 
     // Build command ID (flushes from SYNCHRONIZE_CACHE are standalone, not ORDERED tag flushes)
@@ -403,8 +407,7 @@ BOOLEAN ScsiHandleFlush(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK S
         return ScsiPending(DevExt, Srb);
     } else {
         // Submission failed
-        DevExt->NonTaggedSrbFallback = NULL;
-        DevExt->NonTaggedInFlight = FALSE;
+        DevExt->NonTaggedInFlight = NULL;
         return ScsiBusy(DevExt, Srb);
     }
 }
@@ -521,8 +524,10 @@ BOOLEAN ScsiHandleModeSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
 
     // If unsupported page requested and not "return all", return error
     if (pageCode != MODE_SENSE_RETURN_ALL &&
+        pageCode != MODE_PAGE_FORMAT_DEVICE &&
         pageCode != MODE_PAGE_CACHING &&
         pageCode != MODE_PAGE_CONTROL &&
+        pageCode != MODE_PAGE_RIGID_GEOMETRY &&
         pageCode != MODE_PAGE_POWER_CONDITION &&
         pageCode != MODE_PAGE_FAULT_REPORTING) {
         return ScsiError(DevExt, Srb, SRB_STATUS_INVALID_REQUEST);
@@ -575,7 +580,69 @@ BOOLEAN ScsiHandleModeSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
     if (pageControl == MODE_SENSE_CHANGEABLE_VALUES) {
         // Return all zeros for changeable values (nothing is changeable)
         // Header already zeroed, just set lengths
-    } else if (pageCode == MODE_SENSE_RETURN_ALL || pageCode == MODE_PAGE_CACHING) {
+    } else if (pageCode == MODE_SENSE_RETURN_ALL || pageCode == MODE_PAGE_FORMAT_DEVICE) {
+        // Page 03h: Format Device Page
+        if ((offset + 24) <= Srb->DataTransferLength) {
+            PUCHAR formatPage = buffer + offset;
+            ULONG sectorsPerTrack = 63;
+            ULONG blockSize = DevExt->NamespaceBlockSize ? DevExt->NamespaceBlockSize : 512;
+
+            formatPage[0] = MODE_PAGE_FORMAT_DEVICE;  // Page code
+            formatPage[1] = 22;  // Page length (n-1, total 24 bytes)
+
+            // Bytes 2-3: Tracks per zone (big-endian, 0 = not reported)
+            formatPage[2] = 0x00;
+            formatPage[3] = 0x00;
+
+            // Bytes 4-5: Alternate sectors per zone (big-endian, 0 = not reported)
+            formatPage[4] = 0x00;
+            formatPage[5] = 0x00;
+
+            // Bytes 6-7: Alternate tracks per zone (big-endian, 0 = not reported)
+            formatPage[6] = 0x00;
+            formatPage[7] = 0x00;
+
+            // Bytes 8-9: Alternate tracks per logical unit (big-endian, 0 = not reported)
+            formatPage[8] = 0x00;
+            formatPage[9] = 0x00;
+
+            // Bytes 10-11: Sectors per track (big-endian)
+            formatPage[10] = (UCHAR)((sectorsPerTrack >> 8) & 0xFF);
+            formatPage[11] = (UCHAR)(sectorsPerTrack & 0xFF);
+
+            // Bytes 12-13: Data bytes per physical sector (big-endian)
+            formatPage[12] = (UCHAR)((blockSize >> 8) & 0xFF);
+            formatPage[13] = (UCHAR)(blockSize & 0xFF);
+
+            // Bytes 14-15: Interleave (big-endian, 0 = default)
+            formatPage[14] = 0x00;
+            formatPage[15] = 0x00;
+
+            // Bytes 16-17: Track skew factor (big-endian, 0 = default)
+            formatPage[16] = 0x00;
+            formatPage[17] = 0x00;
+
+            // Bytes 18-19: Cylinder skew factor (big-endian, 0 = default)
+            formatPage[18] = 0x00;
+            formatPage[19] = 0x00;
+
+            // Byte 20: Flags
+            // Bit 7: SSEC (Soft Sector) = 1 (soft sectored)
+            // Bit 6: HSEC (Hard Sector) = 0
+            // Bit 5: RMB (Removable) = 0
+            // Bit 4: SURF (Surface) = 0
+            // Bits 3-0: Reserved
+            formatPage[20] = 0x80;  // SSEC=1 (soft sectored)
+
+            // Bytes 21-23: Reserved
+            formatPage[21] = 0x00;
+            formatPage[22] = 0x00;
+            formatPage[23] = 0x00;
+
+            offset += 24;
+        }
+    }
+    if (pageCode == MODE_SENSE_RETURN_ALL || pageCode == MODE_PAGE_CACHING) {
         // Page 08h: Caching Parameters Page
         if ((offset + 20) <= Srb->DataTransferLength) {
             PUCHAR cachePage = buffer + offset;
@@ -634,6 +701,91 @@ BOOLEAN ScsiHandleModeSense(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLO
             cachePage[19] = 0x00;
 
             offset += 20;
+        }
+    }
+#endif
+#if 1
+    if (pageCode == MODE_SENSE_RETURN_ALL || pageCode == MODE_PAGE_RIGID_GEOMETRY) {
+        // Page 04h: Rigid Disk Geometry Page
+        if ((offset + 24) <= Srb->DataTransferLength) {
+            PUCHAR geometryPage = buffer + offset;
+            ULONGLONG totalCylinders;
+            ULONG sectorsPerTrack = 63;
+            ULONG heads = 64;
+            ULONGLONG numBlocks = DevExt->NamespaceSizeInBlocks;
+            ULONG blockSize = DevExt->NamespaceBlockSize ? DevExt->NamespaceBlockSize : 512;
+
+            // Calculate number of cylinders based on: Total Blocks = Cylinders * Heads * Sectors
+            // Cylinders = Total Blocks / (Heads * Sectors)
+            if (numBlocks > 0) {
+                totalCylinders = numBlocks / (heads * sectorsPerTrack);
+                if (totalCylinders == 0) {
+                    totalCylinders = 1;  // Minimum 1 cylinder
+                }
+            } else {
+                totalCylinders = 1;
+            }
+
+            // Clamp to 24-bit max (16777215 cylinders)
+            if (totalCylinders > 0xFFFFFF) {
+                totalCylinders = 0xFFFFFF;
+            }
+
+            geometryPage[0] = MODE_PAGE_RIGID_GEOMETRY;  // Page code
+            geometryPage[1] = 22;  // Page length (n-1, total 24 bytes)
+
+            // Bytes 2-4: Number of cylinders (24-bit big-endian)
+            geometryPage[2] = (UCHAR)((totalCylinders >> 16) & 0xFF);
+            geometryPage[3] = (UCHAR)((totalCylinders >> 8) & 0xFF);
+            geometryPage[4] = (UCHAR)(totalCylinders & 0xFF);
+
+            // Byte 5: Number of heads
+            geometryPage[5] = (UCHAR)heads;
+
+            // Bytes 6-8: Starting cylinder - write precompensation (obsolete, set to 0)
+            geometryPage[6] = 0x00;
+            geometryPage[7] = 0x00;
+            geometryPage[8] = 0x00;
+
+            // Bytes 9-11: Starting cylinder - reduced write current (obsolete, set to 0)
+            geometryPage[9] = 0x00;
+            geometryPage[10] = 0x00;
+            geometryPage[11] = 0x00;
+
+            // Bytes 12-13: Device step rate (big-endian, 0 = default)
+            geometryPage[12] = 0x00;
+            geometryPage[13] = 0x00;
+
+            // Bytes 14-16: Landing zone cylinder (obsolete, set to 0)
+            geometryPage[14] = 0x00;
+            geometryPage[15] = 0x00;
+            geometryPage[16] = 0x00;
+
+            // Byte 17: RPL (Rotational Position Locking)
+            // Bits 1-0: 00b = None
+            geometryPage[17] = 0x00;
+
+            // Byte 18: Rotational offset (0 = not supported)
+            geometryPage[18] = 0x00;
+
+            // Byte 19: Reserved
+            geometryPage[19] = 0x00;
+
+            // Bytes 20-21: Medium rotation rate (big-endian)
+            // 0x0000 = Not reported
+            // 0x0001 = Non-rotating media (SSD)
+            // 0x0002-0x0400 = Reserved
+            // 0x0401-0xFFFE = Rotations per minute
+            // 0xFFFF = Reserved
+            // For SSDs, we should use 0x0001
+            geometryPage[20] = 0x00;
+            geometryPage[21] = 0x01;  // Non-rotating media (SSD)
+
+            // Bytes 22-23: Reserved
+            geometryPage[22] = 0x00;
+            geometryPage[23] = 0x00;
+
+            offset += 24;
         }
     }
 #endif

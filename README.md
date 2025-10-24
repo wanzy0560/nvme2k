@@ -142,8 +142,8 @@ DriverDisk\
 The driver supports registry-based configuration via the INF file:
 
 - **MaximumSGList** (Default: 512) - Maximum scatter-gather list entries
-- **NumberOfRequests** (Default: 64) - Queue depth
-- **MaxQueueDepth** (Default: 64) - Tagged command queue depth
+- **NumberOfRequests** (Default: 32) - Queue depth
+- **MaxQueueDepth** (Default: 32) - Tagged command queue depth
 
 ## Debugging
 

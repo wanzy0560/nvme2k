@@ -97,9 +97,19 @@ ULONG HwFoundAdapter(
     DevExt->SubsystemVendorId = ReadPciConfigWord(DevExt, PCI_SUBSYSTEM_VENDOR_ID_OFFSET);
     DevExt->SubsystemId = ReadPciConfigWord(DevExt, PCI_SUBSYSTEM_ID_OFFSET);
 
-    // Enable PCI device (Bus Master, Memory Space)
+    // Enable PCI device (Bus Master, Memory Space) but DISABLE interrupts at PCI level
+    // We'll re-enable interrupts later after proper initialization
+    // This prevents interrupt storms from residual controller state
     WritePciConfigWord(DevExt, PCI_COMMAND_OFFSET,
-                      PCI_ENABLE_BUS_MASTER | PCI_ENABLE_MEMORY_SPACE);
+                      PCI_ENABLE_BUS_MASTER | PCI_ENABLE_MEMORY_SPACE | PCI_INTERRUPT_DISABLE);
+
+#ifdef NVME2K_DBG
+    {
+        USHORT cmdReg = ReadPciConfigWord(DevExt, PCI_COMMAND_OFFSET);
+        ScsiDebugPrint(0, "nvme2k: HwFoundAdapter - PCI Command Register = %04X (IntDis=%d)\n",
+                       cmdReg, !!(cmdReg & PCI_INTERRUPT_DISABLE));
+    }
+#endif
 
     // Read interrupt configuration from PCI config space
     // This is probably redundant on Win2K and can be ifdefed out
@@ -333,20 +343,26 @@ ULONG HwFindAdapter(
     ULONG busNumber;
     UCHAR baseClass, subClass, progIf;
     ULONG bytesRead;
-
-#ifdef NVME2K_DBG
-    ScsiDebugPrint(0, "nvme2k: HwFindAdapter:%p called - Bus=%d Slot=%d\n",
-                   DeviceExtension, ConfigInfo->SystemIoBusNumber, ConfigInfo->SlotNumber);
-#endif
+    BOOLEAN PNP = ConfigInfo->NumberOfAccessRanges != 0;
 
     if (HwContext) {
         busNumber = ((PULONG)HwContext)[0];
         slotNumber = ((PULONG)HwContext)[1];
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwFindAdapter:%p called with HwContext - Bus=%d Slot=%d\n",
+                       DeviceExtension, busNumber, slotNumber);
+#endif
     } else {
         // Win2k, PnP gives us this directly
         busNumber = ConfigInfo->SystemIoBusNumber;
         slotNumber = ConfigInfo->SlotNumber;
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwFindAdapter:%p called w/o HwContext - Bus=%d Slot=%d PNP=%d\n",
+                       DeviceExtension, busNumber, slotNumber, PNP);
+#endif
     }
+
+
 scanloop:
     // Read PCI configuration space for THIS slot only
     bytesRead = ScsiPortGetBusData(
@@ -400,18 +416,14 @@ scanloop:
                 ((PULONG)HwContext)[1] = 0;
                 ((PULONG)HwContext)[0]++;
             }
+            *Again = TRUE;
+        } else {
+            *Again = FALSE;
         }
-#if (_WIN32_WINNT < 0x500)
 #ifdef NVME2K_DBG
         if (!HwContext) {
             ScsiDebugPrint(0, "nvme2k: HwFindAdapter - uh oh no HwContext! are we going to scan whole thing again?\n");
         }
-#endif
-        // NT4: Set Again=TRUE to allow detection of multiple NVMe controllers
-        *Again = TRUE;
-#else
-        // Win2K+: PnP will call us again for each device, no need for Again
-        *Again = FALSE;
 #endif
         return HwFoundAdapter(DevExt, ConfigInfo, pciBuffer);
     }
@@ -420,22 +432,13 @@ scanloop:
 #endif
 
 scannext:
-#if (_WIN32_WINNT >= 0x500)
-    // Win2K+: PnP gave us a specific device - don't scan if it's not NVMe
-    if (HwContext == NULL) {
-        *Again = FALSE;
-        return SP_RETURN_NOT_FOUND;
-    }
-#endif
-    // NT4: Continue scanning the bus
+    // NT4 or install time: Continue scanning the bus
     slotNumber++;
     if (slotNumber == (PCI_MAX_DEVICES*PCI_MAX_FUNCTION)) {
         busNumber++;
         slotNumber = 0;
         if (busNumber == 16) { // theoretically 256 but we arent going to waste cycles
-#if (_WIN32_WINNT < 0x500)
             *Again = FALSE;
-#endif
             return SP_RETURN_NOT_FOUND;
         }
     }
@@ -448,13 +451,28 @@ scannext:
 BOOLEAN HwInitialize(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
-    ULONG cc, aqa;
+    ULONG cc, csts, aqa;
     ULONG pageShift;
+    int retryCount;
 
 #ifdef NVME2K_DBG
     ScsiDebugPrint(0, "nvme2k: HwInitialize called\n");
 #endif
-    // Read controller capabilities
+
+    //
+    // NUCLEAR OPTION: Assume the NVMe option ROM or previous driver left the controller
+    // in an unknown state, possibly with queues configured and interrupts firing.
+    // We need to completely reset everything before we start.
+    //
+
+    // Step 1: MASK ALL INTERRUPTS IMMEDIATELY to stop any interrupt storm
+    // This is critical - do this BEFORE reading any other registers or state
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - masking all interrupts\n");
+#endif
+    NvmeWriteReg32(DevExt, NVME_REG_INTMS, 0xFFFFFFFF);  // Mask all 32 interrupt vectors
+
+    // Step 2: Read controller capabilities (needed for timeout calculations)
     DevExt->ControllerCapabilities = NvmeReadReg64(DevExt, NVME_REG_CAP);
     DevExt->Version = NvmeReadReg32(DevExt, NVME_REG_VS);
 
@@ -468,34 +486,105 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
     // Determine page size (4KB minimum for this driver)
     DevExt->PageSize = PAGE_SIZE; // Hardcoded to 4KB
 
-    //
-    // Ensure controller is disabled before configuration.
-    // This is a critical step during re-initialization. The controller might
-    // take some time to clear its RDY bit after a previous shutdown.
-    // We will try a few times to ensure it's disabled.
-    //
-    {
-        int retryCount = 3; // Try up to 3 times
-        while (retryCount > 0) {
-            cc = NvmeReadReg32(DevExt, NVME_REG_CC);
-            cc &= ~NVME_CC_ENABLE;
-            NvmeWriteReg32(DevExt, NVME_REG_CC, cc);
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - CAP=%08X%08X VS=%08X MQES=%u DBS=%u\n",
+                   (ULONG)(DevExt->ControllerCapabilities >> 32),
+                   (ULONG)(DevExt->ControllerCapabilities & 0xFFFFFFFF),
+                   DevExt->Version, DevExt->MaxQueueEntries, DevExt->DoorbellStride);
+#endif
 
+    // Step 3: Check current controller state
+    csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
+    cc = NvmeReadReg32(DevExt, NVME_REG_CC);
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - controller state before reset: CC=%08X CSTS=%08X\n", cc, csts);
+    if (csts & NVME_CSTS_RDY) {
+        ScsiDebugPrint(0, "nvme2k: HwInitialize - WARNING: Controller is READY (option ROM left it enabled!)\n");
+    }
+    if (csts & NVME_CSTS_CFS) {
+        ScsiDebugPrint(0, "nvme2k: HwInitialize - WARNING: Controller Fatal Status bit set!\n");
+    }
+#endif
+
+    // Step 4: Clear any pending interrupts by reading CSTS
+    // This ensures we start from a clean state
+    csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
+
+    // Step 5: Force mask ALL interrupts aggressively
+    // Write to INTMS to set all mask bits (0xFFFFFFFF means mask everything)
+    NvmeWriteReg32(DevExt, NVME_REG_INTMS, 0xFFFFFFFF);
+
+    // Step 5: Clear admin queue registers BEFORE disabling controller
+    // This prevents the controller from trying to access stale queue memory
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - clearing admin queue registers\n");
+#endif
+    NvmeWriteReg32(DevExt, NVME_REG_AQA, 0);
+    NvmeWriteReg64(DevExt, NVME_REG_ASQ, 0);
+    NvmeWriteReg64(DevExt, NVME_REG_ACQ, 0);
+
+    //
+    // Step 5: Force controller disable, regardless of current state
+    // Retry multiple times if needed - the option ROM may have left it in a weird state
+    //
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - disabling controller\n");
+#endif
+    retryCount = 5; // Try up to 5 times with increasing aggression
+    while (retryCount > 0) {
+        // Clear CC.EN and CC.SHN (shutdown notification) bits
+        cc = NvmeReadReg32(DevExt, NVME_REG_CC);
+        cc &= ~(NVME_CC_ENABLE | NVME_CC_SHN_MASK);
+        NvmeWriteReg32(DevExt, NVME_REG_CC, cc);
+
+        // Wait for controller to become not ready
+        if (NvmeWaitForReady(DevExt, FALSE)) {
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwInitialize - controller disabled successfully\n");
+#endif
+            break; // Controller is disabled, proceed
+        }
+
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: HwInitialize - controller disable retry %d/5\n", 6 - retryCount);
+#endif
+        retryCount--;
+
+        // On the last retry, try writing 0 to CC entirely (nuclear option)
+        if (retryCount == 1) {
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwInitialize - trying nuclear option: writing 0 to CC\n");
+#endif
+            NvmeWriteReg32(DevExt, NVME_REG_CC, 0);
             if (NvmeWaitForReady(DevExt, FALSE)) {
-                break; // Controller is disabled, proceed.
+                break;
             }
-            retryCount--;
         }
     }
 
-    // Check if the controller successfully became not ready.
-    if ((NvmeReadReg32(DevExt, NVME_REG_CSTS) & NVME_CSTS_RDY) != 0) {
+    // Step 6: Verify controller is disabled
+    csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
+    if (csts & NVME_CSTS_RDY) {
 #ifdef NVME2K_DBG
-        ScsiDebugPrint(0, "nvme2k: HwInitialize - controller failed to become not ready\n");
+        ScsiDebugPrint(0, "nvme2k: HwInitialize - FATAL: controller failed to disable after 5 retries, CSTS=%08X\n", csts);
 #endif
         return FALSE;
     }
-    
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - controller is now disabled and clean\n");
+#endif
+
+    // CRITICAL: QEMU's nvme_ctrl_reset() clears INTMS register to 0 during controller disable!
+    // This UNMASKS all interrupts, and if there's stale n->irq_status from the option ROM,
+    // QEMU will immediately re-assert the interrupt line.
+    // We MUST mask interrupts again after controller reset completes.
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - re-masking interrupts after controller reset (QEMU clears INTMS during reset)\n");
+#endif
+    NvmeWriteReg32(DevExt, NVME_REG_INTMS, 0xFFFFFFFF);
+
     // Allocate all uncached memory in proper order to avoid alignment waste
     // Order: All 4KB-aligned buffers first, then smaller aligned buffers
     // This minimizes wasted space from alignment padding
@@ -648,7 +737,7 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
          NVME_CC_IOCQES;
     
     NvmeWriteReg32(DevExt, NVME_REG_CC, cc);
-    
+
     // Wait for controller to become ready
     if (!NvmeWaitForReady(DevExt, TRUE)) {
 #ifdef NVME2K_DBG
@@ -657,12 +746,24 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
         return FALSE;
     }
 
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - controller is ready\n");
+#endif
+
+    // IMPORTANT: Keep interrupts MASKED during initialization
+    // We will use POLLING for admin commands during init, then unmask interrupts
+    // only after init completes. This avoids the QEMU interrupt storm issue.
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - keeping interrupts masked, will use polling during init\n");
+#endif
+    // NOTE: Interrupts stay masked (INTMS=0xFFFFFFFF from earlier)
+    // They will be unmasked in the completion handler when InitComplete is set to TRUE
+
     DevExt->NamespaceSizeInBlocks = 0;
     DevExt->NamespaceBlockSize = 512;  // Default to 512 bytes
 
     DevExt->NextNonTaggedId = 0;  // Initialize non-tagged CID sequence
-    DevExt->NonTaggedInFlight = FALSE;  // No non-tagged request in flight initially
-    DevExt->NonTaggedSrbFallback = NULL;
+    DevExt->NonTaggedInFlight = NULL;  // No non-tagged request in flight initially
 
     // Initialize statistics
     DevExt->CurrentQueueDepth = 0;
@@ -690,9 +791,54 @@ BOOLEAN HwInitialize(IN PVOID DeviceExtension)
 
     // Start the initialization sequence
     DevExt->InitComplete = FALSE;
-    
+    DevExt->FallbackTimerNeeded = 1;
     NvmeCreateIoCQ(DevExt);
 
+    // POLL for init completion (interrupts are masked during init)
+    // The completion handler chain will process: Create I/O CQ -> Create I/O SQ ->
+    // Identify Controller -> Identify Namespace -> set InitComplete = TRUE
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize - polling for init completion...\n");
+#endif
+    {
+        ULONG pollCount = 0;
+        while (!DevExt->InitComplete && pollCount < 10000) {  // 10 second timeout
+            NvmeProcessAdminCompletion(DevExt);
+            ScsiPortStallExecution(1000);  // 1ms
+            pollCount++;
+        }
+
+        if (!DevExt->InitComplete) {
+#ifdef NVME2K_DBG
+            ScsiDebugPrint(0, "nvme2k: HwInitialize - TIMEOUT waiting for init completion!\n");
+#endif
+            return FALSE;
+        }
+    }
+
+    // NOW enable interrupts - initialization is complete and HwInitialize is about to return
+    // This is the correct time to enable interrupts: after all init is done but before
+    // HwInitialize returns, so ScsiPort knows we're interrupt-capable.
+
+    // Step 1: Enable interrupts at PCI Command Register level (clear bit 10)
+    {
+        USHORT pciCommand = ReadPciConfigWord(DevExt, PCI_COMMAND_OFFSET);
+        pciCommand &= ~PCI_INTERRUPT_DISABLE;  // Clear interrupt disable bit
+        WritePciConfigWord(DevExt, PCI_COMMAND_OFFSET, pciCommand);
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: Enabled interrupts at PCI level, Command=%04X\n", pciCommand);
+#endif
+    }
+
+    // Step 2: Unmask interrupts at NVMe controller level (unmask vector 0)
+    NvmeWriteReg32(DevExt, NVME_REG_INTMC, 0x00000001);
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: Unmasked interrupts at NVMe controller level (INTMC=0x00000001)\n");
+#endif
+
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: HwInitialize finished successfully - interrupts enabled\n");
+#endif
     return TRUE;
 }
 
@@ -710,11 +856,47 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
                    Srb->Function, Srb->PathId, Srb->TargetId, Srb->Lun);
 #endif
 
+#if 0
+    // Poll completion queues as a backup in case interrupts are delayed
+    // This helps performance on busy systems
+    if (DevExt->InitComplete) {
+        if (DevExt->CurrentQueueDepth > 0 || DevExt->NonTaggedInFlight) {
+            NvmeProcessAdminCompletion(DevExt);
+            NvmeProcessIoCompletion(DevExt);
+        }
+    }
+#endif
+
     // Check if the request is for our device (PathId=0, TargetId=0, Lun=0)
     if (Srb->PathId != 0 || Srb->TargetId != 0 || Srb->Lun != 0) {
-        // Not our device
+        // Not our device - distinguish between invalid target and invalid LUN
         if (Srb->Function == SRB_FUNCTION_EXECUTE_SCSI) {
-            Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
+            // Check if this is an invalid LUN on our target (Path=0, Target=0, but Lun != 0)
+            if (Srb->PathId == 0 && Srb->TargetId == 0 && Srb->Lun != 0) {
+                // Invalid LUN on our target - return error with sense data
+                PSENSE_DATA senseBuffer;
+
+                Srb->SrbStatus = SRB_STATUS_ERROR;
+                Srb->ScsiStatus = 0x02;  // CHECK_CONDITION
+
+                // Fill in sense data if AutoRequestSense is enabled and buffer is available
+                if (Srb->SenseInfoBuffer != NULL && Srb->SenseInfoBufferLength >= sizeof(SENSE_DATA)) {
+                    senseBuffer = (PSENSE_DATA)Srb->SenseInfoBuffer;
+                    RtlZeroMemory(senseBuffer, sizeof(SENSE_DATA));
+
+                    senseBuffer->ErrorCode = 0x70;  // Current error, fixed format
+                    senseBuffer->Valid = 0;
+                    senseBuffer->SenseKey = SCSI_SENSE_ILLEGAL_REQUEST;
+                    senseBuffer->AdditionalSenseLength = sizeof(SENSE_DATA) - 8;
+                    senseBuffer->AdditionalSenseCode = SCSI_ADSENSE_INVALID_LUN;
+                    senseBuffer->AdditionalSenseCodeQualifier = 0x00;
+
+                    Srb->SrbStatus |= SRB_STATUS_AUTOSENSE_VALID;
+                }
+            } else {
+                // Invalid target or path - selection timeout
+                Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
+            }
         } else {
             Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         }
@@ -737,8 +919,8 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
                     case SRB_HEAD_OF_QUEUE_TAG_REQUEST: queueType = "HEAD_OF_QUEUE"; break;
                     case SRB_ORDERED_QUEUE_TAG_REQUEST: queueType = "ORDERED"; break;
                 }
-                ScsiDebugPrint(0, "nvme2k: Tagged queuing enabled - QueueAction=%s (0x%02X)\n",
-                               queueType, Srb->QueueAction);
+                ScsiDebugPrint(0, "nvme2k: Tagged queuing enabled - QueueAction=%s (0x%02X) Tag:%02X\n",
+                               queueType, Srb->QueueAction, Srb->QueueTag);
             }
 #endif
             // Process SCSI CDB
@@ -877,6 +1059,18 @@ BOOLEAN HwStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     return TRUE;
 }
 
+VOID FallbackTimer(IN PVOID DeviceExtension)
+{
+    PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
+
+    DevExt->FallbackTimerNeeded++;
+    if (!DevExt->FallbackTimerNeeded)
+        DevExt->FallbackTimerNeeded = 1;
+
+    NvmeProcessAdminCompletion(DevExt);
+    NvmeProcessIoCompletion(DevExt);
+}
+
 //
 // HwInterrupt - ISR for adapter
 //
@@ -884,6 +1078,15 @@ BOOLEAN HwInterrupt(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION DevExt = (PHW_DEVICE_EXTENSION)DeviceExtension;
     BOOLEAN interruptHandled = FALSE;
+
+    if (DevExt->FallbackTimerNeeded) {
+        // cancel the fallback timer
+        ScsiPortNotification(RequestTimerCall, DeviceExtension, FallbackTimer, 0);
+        // interrupts worked a million times, we probably dont need a fallback
+        if (DevExt->FallbackTimerNeeded >= 1000000) {
+            DevExt->FallbackTimerNeeded = 0;
+        }
+    }   
 
 #ifdef NVME2K_USE_INTERRUPT_LOCK
     // Serialize interrupt handler to prevent SMP reentrancy issues

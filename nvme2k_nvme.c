@@ -138,6 +138,11 @@ static BOOLEAN NvmeSubmitCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_QUEUE 
     // Update tail
     Queue->SubmissionQueueTail = nextTail;
 
+    if (DevExt->FallbackTimerNeeded) {
+        // if we didnt get an interrupt in a milisecond something is wrong with interrupts
+        ScsiPortNotification(RequestTimerCall, (PVOID)DevExt, FallbackTimer, 1000);
+    }
+    
     // Ring doorbell
     NvmeRingDoorbell(DevExt, Queue->QueueId, TRUE, (USHORT)(Queue->SubmissionQueueTail));
 
@@ -326,9 +331,13 @@ BOOLEAN NvmeGetLogPage(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Sr
 
     // ScsiPort manages the untagged SRB, we can retrieve it in completion with ScsiPortGetSrb()
     
-    DevExt->NonTaggedInFlight = TRUE;
-    DevExt->NonTaggedSrbFallback = Srb;
-    return NvmeSubmitAdminCommand(DevExt, &cmd);
+    DevExt->NonTaggedInFlight = Srb;
+    if (!NvmeSubmitAdminCommand(DevExt, &cmd)) {
+        DevExt->NonTaggedInFlight = NULL;
+        return FALSE;
+    } else {
+        return TRUE;
+    }
 }
 
 //
@@ -396,9 +405,10 @@ PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN U
     // Call ScsiPortGetSrb to retrieve the SRB
     // PathId=0, TargetId=0, Lun=0 for our single device
     Srb = ScsiPortGetSrb(DevExt, 0, 0, 0, queueTag);
-    if (!Srb && queueTag == SP_UNTAGGED) {
-        Srb = DevExt->NonTaggedSrbFallback;
-        DevExt->NonTaggedSrbFallback = NULL;
+    if (queueTag == SP_UNTAGGED) {
+        if (!Srb)
+            Srb = DevExt->NonTaggedInFlight;
+        DevExt->NonTaggedInFlight = NULL;
     }
     return Srb;
 }
@@ -406,7 +416,7 @@ PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN U
 //
 // NvmeBuildReadWriteCommand - Build NVMe Read/Write command from SCSI CDB
 //
-VOID NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId)
+BOOLEAN NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId)
 {
     PCDB cdb = (PCDB)Srb->Cdb;
     ULONGLONG lba = 0;
@@ -545,7 +555,7 @@ VOID NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_
             // No PRP list pages available - this shouldn't happen if we sized correctly
             ScsiDebugPrint(0, "nvme2k: ERROR - No PRP list pages available!\n");
             Cmd->PRP2 = 0;
-            return;
+            return FALSE;
         }
 
         // Store PRP list page in SRB extension
@@ -598,11 +608,13 @@ VOID NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_
     Cmd->CDW13 = 0;
     Cmd->CDW14 = 0;
     Cmd->CDW15 = 0;
+    return TRUE;
 }
 
 //
 // NvmeShutdownController - Perform clean shutdown of NVMe controller
 // Deletes I/O queues, issues shutdown notification, and disables controller
+// Robust version that handles partially initialized or unknown controller state
 //
 VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
 {
@@ -614,6 +626,22 @@ VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
 #ifdef NVME2K_DBG
     ScsiDebugPrint(0, "nvme2k: NvmeShutdownController - starting shutdown sequence\n");
 #endif
+
+    // First, mask all interrupts to prevent interrupt storms during shutdown
+    NvmeWriteReg32(DevExt, NVME_REG_INTMS, 0xFFFFFFFF);
+#ifdef NVME2K_DBG
+    ScsiDebugPrint(0, "nvme2k: NvmeShutdownController - masked all interrupts\n");
+#endif
+
+    // Check if controller is even enabled before trying to delete queues
+    csts = NvmeReadReg32(DevExt, NVME_REG_CSTS);
+    if (!(csts & NVME_CSTS_RDY)) {
+#ifdef NVME2K_DBG
+        ScsiDebugPrint(0, "nvme2k: NvmeShutdownController - controller not ready, skipping queue deletion\n");
+#endif
+        // Controller is already disabled, just clean up state and return
+        goto cleanup_state;
+    }
 
     // Step 1: Delete I/O Submission Queue (must be deleted before CQ)
     if (DevExt->InitComplete && DevExt->IoQueue.SubmissionQueue != NULL) {
@@ -732,7 +760,7 @@ VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
     NvmeWriteReg64(DevExt, NVME_REG_ASQ, 0);
     NvmeWriteReg64(DevExt, NVME_REG_ACQ, 0);
 
-
+cleanup_state:
     // Step 8: Reset queue software state to match hardware reset state
     // When controller is disabled (CC.EN=0), hardware resets doorbell registers to 0
     // We must reset our software state to match, otherwise re-initialization will fail
@@ -768,7 +796,7 @@ VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt)
 
     // Clear init state
     DevExt->InitComplete = FALSE;
-    DevExt->NonTaggedInFlight = FALSE;
+    DevExt->NonTaggedInFlight = NULL;
 
 #ifdef NVME2K_DBG
     ScsiDebugPrint(0, "nvme2k: Shutdown sequence complete\n");

@@ -14,7 +14,8 @@
 
 #define NVME2K_DBG
 // extra spammy logging for NVMe commands
-// #define NVME2K_DBG_CMD
+//#define NVME2K_DBG_CMD
+//#define NVME2K_DBG_EXTRA
 // uncomment to enable debugging and logging
 /* for debug messages use
  * ScsiDebugPrint(0, "nvme2k: ...\n");
@@ -74,6 +75,7 @@
 #define PCI_ENABLE_IO_SPACE                 0x0001
 #define PCI_ENABLE_MEMORY_SPACE             0x0002
 #define PCI_ENABLE_BUS_MASTER               0x0004
+#define PCI_INTERRUPT_DISABLE               0x0400  // Bit 10: Disable INTx interrupt assertion
 
 //
 // NVMe Controller Registers (offset from BAR0)
@@ -762,9 +764,9 @@ typedef struct _HW_DEVICE_EXTENSION {
     NVME_QUEUE IoQueue;                             // Offset 0x78 (120) - 56 bytes [8-byte aligned]
 
     // Command tracking
-    PSCSI_REQUEST_BLOCK NonTaggedSrbFallback;       // Offset 0xB0 (176)
+    PSCSI_REQUEST_BLOCK NonTaggedInFlight;          // Offset 0xB0 (176)
     USHORT NextNonTaggedId;                         // Offset 0xB4 (180)
-    BOOLEAN NonTaggedInFlight;                      // Offset 0xB6 (182)
+    BOOLEAN Reserved3_1;                            // Offset 0xB6 (182)
     BOOLEAN InitComplete;                           // Offset 0xB7 (183)
 
     // SMP synchronization for interrupt handler
@@ -813,6 +815,7 @@ typedef struct _HW_DEVICE_EXTENSION {
     PHYSICAL_ADDRESS UncachedExtensionPhys;         // Offset 0x170 (368) [8-byte aligned]
     PVOID UncachedExtensionBase;                    // Offset 0x178 (376)
     ULONG UncachedExtensionSize;                    // Offset 0x17C (380)
+    ULONG FallbackTimerNeeded;
 
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;       // Total size: 0x180 (384) bytes
 
@@ -860,12 +863,13 @@ BOOLEAN NvmeSubmitIoCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_COMMAND Cmd
 BOOLEAN NvmeSubmitAdminCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PNVME_COMMAND Cmd);
 BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeShutdownController(IN PHW_DEVICE_EXTENSION DevExt);
+VOID FallbackTimer(IN PVOID DeviceExtension);
 VOID NvmeProcessGetLogPageCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT status, USHORT commandId);
 BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt);
 VOID NvmeRingDoorbell(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT QueueId, IN BOOLEAN IsSubmission, IN USHORT Value);
 BOOLEAN NvmeCreateIoCQ(IN PHW_DEVICE_EXTENSION DevExt);
 BOOLEAN NvmeCreateIoSQ(IN PHW_DEVICE_EXTENSION DevExt);
-VOID NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId);
+BOOLEAN NvmeBuildReadWriteCommand(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb, IN PNVME_COMMAND Cmd, IN USHORT CommandId);
 USHORT NvmeBuildCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN PSCSI_REQUEST_BLOCK Srb);
 USHORT NvmeBuildFlushCommandId(IN PSCSI_REQUEST_BLOCK Srb);
 PSCSI_REQUEST_BLOCK NvmeGetSrbFromCommandId(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT CommandId);

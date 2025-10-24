@@ -18,7 +18,7 @@ VOID NvmeProcessGetLogPageCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT s
 
     if (!Srb) {
 #ifdef NVME2K_DBG
-        ScsiDebugPrint(0, "nvme2k: Get Log Page completion - ScsiPortGetSrb returned NULL\n");
+        ScsiDebugPrint(0, "nvme2k: Get Log Page completion - missing Srb!\n");
 #endif
         // we can use prpPageIndex to free the log page so we dont leak them
     } else {
@@ -127,8 +127,6 @@ VOID NvmeProcessGetLogPageCompletion(IN PHW_DEVICE_EXTENSION DevExt, IN USHORT s
         ScsiPortNotification(RequestComplete, DevExt, Srb);
     }
 
-    DevExt->NonTaggedInFlight = FALSE;
-    DevExt->NonTaggedSrbFallback = NULL;
     FreePrpListPage(DevExt, prpPageIndex);
 }
 
@@ -195,13 +193,29 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
             switch (commandId) {
                 case ADMIN_CID_CREATE_IO_CQ:
                     if (status == NVME_SC_SUCCESS) {
+#ifdef NVME2K_DBG
+                        ScsiDebugPrint(0, "nvme2k: I/O CQ created successfully - DW0=%08X SQID=%u\n",
+                                       cqEntry->DW0, cqEntry->SQID);
+#endif
                         NvmeCreateIoSQ(DevExt);
+                    } else {
+#ifdef NVME2K_DBG
+                        ScsiDebugPrint(0, "nvme2k: ERROR - I/O CQ creation failed with status 0x%04X\n", status);
+#endif
                     }
                     break;
 
                 case ADMIN_CID_CREATE_IO_SQ:
                     if (status == NVME_SC_SUCCESS) {
+#ifdef NVME2K_DBG
+                        ScsiDebugPrint(0, "nvme2k: I/O SQ created successfully - DW0=%08X SQID=%u\n",
+                                       cqEntry->DW0, cqEntry->SQID);
+#endif
                         NvmeIdentifyController(DevExt);
+                    } else {
+#ifdef NVME2K_DBG
+                        ScsiDebugPrint(0, "nvme2k: ERROR - I/O SQ creation failed with status 0x%04X\n", status);
+#endif
                     }
                     break;
 
@@ -247,6 +261,10 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 #endif
 
                         DevExt->InitComplete = TRUE;
+
+#ifdef NVME2K_DBG
+                        ScsiDebugPrint(0, "nvme2k: Init complete - driver ready for I/O\n");
+#endif
                     }
                     break;
 
@@ -280,8 +298,11 @@ BOOLEAN NvmeProcessAdminCompletion(IN PHW_DEVICE_EXTENSION DevExt)
                 }
             }
         }
+    }
 
-        // Ring completion doorbell with the new head position
+    // Ring completion doorbell ONCE with the final head position after processing all completions
+    // This acknowledges all processed completions and clears the interrupt
+    if (processed) {
         NvmeRingDoorbell(DevExt, Queue->QueueId, FALSE, (USHORT)(Queue->CompletionQueueHead & Queue->QueueSizeMask));
     }
 
@@ -306,6 +327,12 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
     PSCSI_REQUEST_BLOCK Srb;
     ULONG queueIndex;
     ULONG expectedPhase;
+
+#ifdef NVME2K_DBG_EXTRA
+    if (DevExt->TotalRequests) {
+        ScsiDebugPrint(0, "nvme2k: NvmeProcessIoCompletion called\n");
+    }
+#endif
 
 #ifdef NVME2K_USE_COMPLETION_LOCK
     // Acquire completion queue spinlock - protects against concurrent interrupt handler calls
@@ -338,6 +365,10 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 
         processed = TRUE;
 
+#ifdef NVME2K_DBG_EXTRA
+        ScsiDebugPrint(0, "nvme2k: I/O completion found! QueueIdx=%d Phase=%d\n", queueIndex, expectedPhase);
+#endif
+
         // Extract status and command ID
         status = (cqEntry->Status >> 1) & 0xFF;
         commandId = cqEntry->CID;
@@ -364,7 +395,6 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 #ifdef NVME2K_DBG
                 ScsiDebugPrint(0, "nvme2k: Clearing NonTaggedInFlight flag for orphaned CID\n");
 #endif
-                DevExt->NonTaggedInFlight = FALSE;
             }
         } else {
             PNVME_SRB_EXTENSION srbExt;
@@ -376,8 +406,8 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
                                commandId, Srb->SrbStatus, SRB_STATUS_PENDING);
                 ScsiDebugPrint(0, "nvme2k:        This suggests DOUBLE COMPLETION! SRB=%p\n", Srb);
 #endif
-                // Skip this - it's already been completed
-                goto io_ring_doorbell;
+                // Skip this - it's already been completed, continue to next completion
+                continue;
             }
 
             if (Srb->Function != SRB_FUNCTION_EXECUTE_SCSI) {
@@ -391,8 +421,8 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
 #ifdef NVME2K_DBG
                 ScsiDebugPrint(0, "nvme2k: ERROR - SRB CID=%d has NULL SrbExtension!\n", commandId);
 #endif
-                // Skip this completion
-                goto io_ring_doorbell;
+                // Skip this completion, continue to next completion
+                continue;
             }
 
             // Get SRB extension for PRP list cleanup
@@ -402,12 +432,6 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
             if (srbExt->PrpListPage != 0xFF) {
                 FreePrpListPage(DevExt, srbExt->PrpListPage);
                 srbExt->PrpListPage = 0xFF;
-            }
-
-            // Check if this was a non-tagged request and clear the flag
-            if (commandId & CID_NON_TAGGED_FLAG) {
-                DevExt->NonTaggedInFlight = FALSE;
-                DevExt->NonTaggedSrbFallback = NULL;
             }
 
             // Set SRB status based on NVMe status
@@ -451,8 +475,11 @@ BOOLEAN NvmeProcessIoCompletion(IN PHW_DEVICE_EXTENSION DevExt)
                 DevExt->CurrentQueueDepth--;
             }
         }
-io_ring_doorbell:
-        // Ring completion doorbell with the new head position
+    }
+
+    // Ring completion doorbell ONCE with the final head position after processing all completions
+    // This acknowledges all processed completions and clears the interrupt
+    if (processed) {
         NvmeRingDoorbell(DevExt, Queue->QueueId, FALSE, (USHORT)(Queue->CompletionQueueHead & Queue->QueueSizeMask));
     }
 

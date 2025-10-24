@@ -43,6 +43,7 @@ StartType      = %SERVICE_BOOT_START%
 ErrorControl   = %SERVICE_ERROR_NORMAL%
 ServiceBinary  = %12%\nvme2k.sys
 LoadOrderGroup = SCSI Miniport
+Tag            = 33
 AddReg         = pnpsafe_pci_addreg
 
 [NVMe_CopyFiles]
@@ -52,9 +53,9 @@ nvme2k.sys
 HKR, "Parameters\PnpInterface", "5", %REG_DWORD%, 0x00000001
 HKR, "Parameters\Device", "DriverParameter", %REG_SZ%, "PlaceHolder=0"
 HKR, "Parameters\Device", "MaximumSGList", %REG_DWORD%, 0x00000200
-HKR, "Parameters\Device", "NumberOfRequests", %REG_DWORD%, 0x00000040
+HKR, "Parameters\Device", "NumberOfRequests", %REG_DWORD%, 0x00000020
 ; Enable tagged command queuing
-HKR, "Parameters\Device", "MaxQueueDepth", %REG_DWORD%, 0x00000040
+HKR, "Parameters\Device", "MaxQueueDepth", %REG_DWORD%, 0x00000020
 ; Windows 2000 requires this key to enable multiple outstanding requests
 HKLM, "System\CurrentControlSet\Services\Disk", "TimeOutValue", %REG_DWORD%, 0x0000003C
 ; Attempt to pin interrupt to CPU 0 (may not be supported on Windows 2000)
